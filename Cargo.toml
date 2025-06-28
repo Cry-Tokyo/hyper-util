@@ -34,6 +34,7 @@ socket2 = { version = "0.5.9", optional = true, features = ["all"] }
 tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 tokio = { version = "1", optional = true, default-features = false  }
 tower-service = { version = "0.3", optional = true }
+h3 = {git = "https://github.com/hyperium/h3.git", optional = true}
 
 [dev-dependencies]
 hyper = { version = "1.4.0", features = ["full"] }
@@ -54,7 +55,7 @@ system-configuration = { version = "0.6.1", optional = true }
 windows-registry = { version = "0.5", optional = true }
 
 [features]
-default = []
+default = ["full"]
 
 # Shorthand to enable everything
 full = [
@@ -68,6 +69,7 @@ full = [
     "service",
     "http1",
     "http2",
+    "http3",
     "tokio",
     "tracing",
 ]
@@ -78,13 +80,15 @@ client-proxy = ["client", "dep:base64", "dep:ipnet", "dep:percent-encoding"]
 client-proxy-system = ["dep:system-configuration", "dep:windows-registry"]
 
 server = ["hyper/server"]
-server-auto = ["server", "http1", "http2"]
+server-auto = ["server", "http1", "http2", "http3"]
 server-graceful = ["server", "tokio/sync"]
 
 service = ["dep:tower-service"]
 
 http1 = ["hyper/http1"]
 http2 = ["hyper/http2"]
+http3 = ["dep:h3"]
+
 
 tokio = ["dep:tokio", "tokio/net", "tokio/rt", "tokio/time"]
 
