@@ -3,6 +3,7 @@
 pub mod upgrade;
 
 use hyper::service::HttpService;
+use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
@@ -25,6 +26,9 @@ use hyper::server::conn::http1;
 
 #[cfg(feature = "http2")]
 use hyper::{rt::bounds::Http2ServerConnExec, server::conn::http2};
+
+#[cfg(feature = "http3")]
+use h3 as http3;
 
 #[cfg(any(not(feature = "http2"), not(feature = "http1")))]
 use std::marker::PhantomData;
@@ -60,10 +64,35 @@ pub struct Builder<E> {
     http1: http1::Builder,
     #[cfg(feature = "http2")]
     http2: http2::Builder<E>,
-    #[cfg(any(feature = "http1", feature = "http2"))]
+    #[cfg(feature = "http3")]
+    http3: http3::server::Builder,
+
+    #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
     version: Option<Version>,
-    #[cfg(not(feature = "http2"))]
+    #[cfg(not(any(feature = "http2", feature = "http3")))]
     _executor: E,
+}
+
+impl<E: Debug> Debug for Builder<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ds = f.debug_struct("Builder");
+        #[cfg(feature = "http1")]
+        ds.field("http1", &self.http1);
+
+        #[cfg(feature = "http2")]
+        ds.field("http2", &self.http2);
+
+        #[cfg(feature = "http3")]
+        ds.field("http3", &"&self.http3");
+
+        #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
+        ds.field("version", &self.version);
+
+        #[cfg(not(any(feature = "http2", feature = "http3")))]
+        ds.field("_executor", &self._executor);
+
+        ds.finish()
+    }
 }
 
 impl<E: Default> Default for Builder<E> {
@@ -94,9 +123,11 @@ impl<E> Builder<E> {
             http1: http1::Builder::new(),
             #[cfg(feature = "http2")]
             http2: http2::Builder::new(executor),
-            #[cfg(any(feature = "http1", feature = "http2"))]
+            #[cfg(feature = "http3")]
+            http3: http3::Builder::new(executor),
+            #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
             version: None,
-            #[cfg(not(feature = "http2"))]
+            #[cfg(not(any(feature = "http2", feature = "http3")))]
             _executor: executor,
         }
     }
@@ -111,6 +142,24 @@ impl<E> Builder<E> {
     #[cfg(feature = "http2")]
     pub fn http2(&mut self) -> Http2Builder<'_, E> {
         Http2Builder { inner: self }
+    }
+
+    /// Http3 configuration.
+    #[cfg(feature = "http3")]
+    pub fn http3(&mut self) -> Http3Builder<'_, E> {
+        Http3Builder { inner: self }
+    }
+
+    /// Only accepts HTTP/3
+    ///
+    /// Does not do anything if used with [`serve_connection_with_upgrades`]
+    ///
+    /// [`serve_connection_with_upgrades`]: Builder::serve_connection_with_upgrades
+    #[cfg(feature = "http3")]
+    pub fn http3_only(mut self) -> Self {
+        assert!(self.version.is_none());
+        self.version = Some(Version::H3);
+        self
     }
 
     /// Only accepts HTTP/2
@@ -144,7 +193,9 @@ impl<E> Builder<E> {
             Some(Version::H1) => true,
             #[cfg(feature = "http2")]
             Some(Version::H2) => false,
-            #[cfg(any(feature = "http1", feature = "http2"))]
+            #[cfg(feature = "http3")]
+            Some(Version::H3) => false,
+            #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
             _ => true,
         }
     }
@@ -156,7 +207,23 @@ impl<E> Builder<E> {
             Some(Version::H1) => false,
             #[cfg(feature = "http2")]
             Some(Version::H2) => true,
-            #[cfg(any(feature = "http1", feature = "http2"))]
+            #[cfg(feature = "http3")]
+            Some(Version::H3) => false,
+            #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
+            _ => true,
+        }
+    }
+
+    /// Returns `true` if this builder can serve an HTTP/3-based connection.
+    pub fn is_http3_available(&self) -> bool {
+        match self.version {
+            #[cfg(feature = "http1")]
+            Some(Version::H1) => false,
+            #[cfg(feature = "http2")]
+            Some(Version::H2) => false,
+            #[cfg(feature = "http3")]
+            Some(Version::H3) => true,
+            #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
             _ => true,
         }
     }
@@ -185,7 +252,13 @@ impl<E> Builder<E> {
                 let conn = self.http2.serve_connection(io, service);
                 ConnState::H2 { conn }
             }
-            #[cfg(any(feature = "http1", feature = "http2"))]
+            #[cfg(feature = "http3")]
+            Some(Version::H3) => {
+                let io = Rewind::new_buffered(io, Bytes::new());
+                let conn = self.http3.serve_connection(io, service);
+                ConnState::H3 { conn }
+            }
+            #[cfg(any(feature = "http1", feature = "http2", feature = "http3"))]
             _ => ConnState::ReadVersion {
                 read_version: read_version(io),
                 builder: Cow::Borrowed(self),
@@ -233,15 +306,17 @@ impl<E> Builder<E> {
 enum Version {
     H1,
     H2,
+    H3,
 }
 
 impl Version {
     #[must_use]
-    #[cfg(any(not(feature = "http2"), not(feature = "http1")))]
+    #[cfg(any(not(feature = "http3"), not(feature = "http2"), not(feature = "http1")))]
     pub fn unsupported(self) -> Error {
         match self {
             Version::H1 => Error::from("HTTP/1 is not supported"),
             Version::H2 => Error::from("HTTP/2 is not supported"),
+            Version::H3 => Error::from("HTTP/3 is not supported"),
         }
     }
 }
@@ -367,6 +442,12 @@ type Http2Connection<I, S, E> = hyper::server::conn::http2::Connection<Rewind<I>
 #[cfg(not(feature = "http2"))]
 type Http2Connection<I, S, E> = (PhantomData<I>, PhantomData<S>, PhantomData<E>);
 
+#[cfg(feature = "http3")]
+type Http3Connection<I, S, E> = hyper::server::conn::http3::Connection<I, S, E>;
+
+#[cfg(not(feature = "http3"))]
+type Http3Connection<I, S, E> = (PhantomData<I>, PhantomData<S>, PhantomData<E>);
+
 pin_project! {
     #[project = ConnStateProj]
     enum ConnState<'a, I, S, E>
@@ -386,6 +467,10 @@ pin_project! {
         H2 {
             #[pin]
             conn: Http2Connection<I, S, E>,
+        },
+        H3 {
+            #[pin]
+            conn: Http3Connection<I, S, E>,
         },
     }
 }
@@ -414,7 +499,9 @@ where
             ConnStateProj::H1 { conn } => conn.graceful_shutdown(),
             #[cfg(feature = "http2")]
             ConnStateProj::H2 { conn } => conn.graceful_shutdown(),
-            #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+            #[cfg(feature = "http3")]
+            ConnStateProj::H3 { conn } => conn.graceful_shutdown(),
+            #[cfg(any(not(feature = "http1"), not(feature = "http2"), not(feature = "http3")))]
             _ => unreachable!(),
         }
     }
@@ -439,7 +526,9 @@ where
                 ConnState::H1 { conn } => ConnState::H1 { conn },
                 #[cfg(feature = "http2")]
                 ConnState::H2 { conn } => ConnState::H2 { conn },
-                #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+                #[cfg(feature = "http3")]
+                ConnState::H3 { conn } => ConnState::H3 { conn },
+                #[cfg(any(not(feature = "http1"), not(feature = "http2"), not(feature = "http3")))]
                 _ => unreachable!(),
             },
         }
@@ -481,7 +570,16 @@ where
                             let conn = builder.http2.serve_connection(io, service);
                             this.state.set(ConnState::H2 { conn });
                         }
-                        #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+                        #[cfg(feature = "http3")]
+                        Version::H3 => {
+                            let conn = builder.http3.serve_connection(io, service);
+                            this.state.set(ConnState::H3 { conn });
+                        }
+                        #[cfg(any(
+                            not(feature = "http1"),
+                            not(feature = "http2"),
+                            not(feature = "http3")
+                        ))]
                         _ => return Poll::Ready(Err(version.unsupported())),
                     }
                 }
@@ -493,7 +591,11 @@ where
                 ConnStateProj::H2 { conn } => {
                     return conn.poll(cx).map_err(Into::into);
                 }
-                #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+                #[cfg(feature = "http3")]
+                ConnStateProj::H3 { conn } => {
+                    return conn.poll(cx).map_err(Into::into);
+                }
+                #[cfg(any(not(feature = "http1"), not(feature = "http2"), not(feature = "http3")))]
                 _ => unreachable!(),
             }
         }
@@ -542,6 +644,10 @@ pin_project! {
             #[pin]
             conn: Http2Connection<I, S, E>,
         },
+        H3 {
+            #[pin]
+            conn: Http3Connection<I, S, E>,
+        },
     }
 }
 
@@ -569,7 +675,9 @@ where
             UpgradeableConnStateProj::H1 { conn } => conn.graceful_shutdown(),
             #[cfg(feature = "http2")]
             UpgradeableConnStateProj::H2 { conn } => conn.graceful_shutdown(),
-            #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+            #[cfg(feature = "http3")]
+            UpgradeableConnStateProj::H3 { conn } => conn.graceful_shutdown(),
+            #[cfg(any(not(feature = "http1"), not(feature = "http2"), not(feature = "http3")))]
             _ => unreachable!(),
         }
     }
@@ -594,7 +702,9 @@ where
                 UpgradeableConnState::H1 { conn } => UpgradeableConnState::H1 { conn },
                 #[cfg(feature = "http2")]
                 UpgradeableConnState::H2 { conn } => UpgradeableConnState::H2 { conn },
-                #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+                #[cfg(feature = "http3")]
+                UpgradeableConnState::H3 { conn } => UpgradeableConnState::H3 { conn },
+                #[cfg(any(not(feature = "http1"), not(feature = "http2"), not(feature = "http3")))]
                 _ => unreachable!(),
             },
         }
@@ -636,7 +746,16 @@ where
                             let conn = builder.http2.serve_connection(io, service);
                             this.state.set(UpgradeableConnState::H2 { conn });
                         }
-                        #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+                        #[cfg(feature = "http3")]
+                        Version::H3 => {
+                            let conn = builder.http3.serve_connection(io, service);
+                            this.state.set(UpgradeableConnState::H3 { conn });
+                        }
+                        #[cfg(any(
+                            not(feature = "http1"),
+                            not(feature = "http2"),
+                            not(feature = "http3")
+                        ))]
                         _ => return Poll::Ready(Err(version.unsupported())),
                     }
                 }
@@ -648,7 +767,11 @@ where
                 UpgradeableConnStateProj::H2 { conn } => {
                     return conn.poll(cx).map_err(Into::into);
                 }
-                #[cfg(any(not(feature = "http1"), not(feature = "http2")))]
+                #[cfg(feature = "http3")]
+                UpgradeableConnStateProj::H3 { conn } => {
+                    return conn.poll(cx).map_err(Into::into);
+                }
+                #[cfg(any(not(feature = "http1"), not(feature = "http2"), not(feature = "http3")))]
                 _ => unreachable!(),
             }
         }
